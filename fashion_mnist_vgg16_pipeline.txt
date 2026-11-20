@@ -1,0 +1,333 @@
+FASHION-MNIST TRANSFER LEARNING WITH VGG16
+==========================================
+
+Project status
+--------------
+This file contains the complete training and evaluation pipeline.
+Run it in Google Colab after uploading fashion-mnist_train.csv.
+
+Dataset:
+- Fashion-MNIST training CSV
+- Expected shape: (60000, 785)
+- Column 0: class label
+- Columns 1-784: flattened 28x28 grayscale pixels
+
+IMPORTANT NOTES
+---------------
+1. This pipeline converts each grayscale image to 3-channel RGB because
+   pretrained VGG16 expects 3-channel images.
+2. Images are resized/cropped to 224x224 and normalized using ImageNet
+   statistics because VGG16 was pretrained on ImageNet.
+3. The pretrained VGG16 feature extractor is frozen. Only the classifier
+   head is trained.
+4. The model checkpoint saves the state_dict. To use it later, recreate
+   the same VGG16 architecture and load this state_dict.
+5. The original code's deprecated pretrained=True argument is replaced
+   with the current weights=VGG16_Weights.DEFAULT form.
+6. The checkpoint filename is vgg16_fashion_81.pth. The '81' in the
+   filename is only a label; it does not guarantee 81% accuracy.
+
+STEP 1 — IMPORT LIBRARIES
+------------------------
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+import matplotlib.pyplot as plt
+import torchvision.models as models
+from torchvision.transforms import transforms
+
+from PIL import Image
+import numpy as np
+
+
+STEP 2 — SET RANDOM SEED AND DEVICE
+-----------------------------------
+torch.manual_seed(42)
+
+# Check whether a CUDA GPU is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+
+STEP 3 — LOAD THE DATASET
+-------------------------
+df = pd.read_csv('/content/fashion-mnist_train.csv')
+
+print(df.head())
+print(df.shape)  # Expected: (60000, 785)
+
+
+STEP 4 — SEPARATE FEATURES AND LABELS
+-------------------------------------
+X = df.iloc[:, 1:].values
+y = df.iloc[:, 0].values
+
+
+STEP 5 — TRAIN-TEST SPLIT
+-------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42
+)
+
+
+STEP 6 — DEFINE IMAGE TRANSFORMS
+--------------------------------
+custom_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+STEP 7 — CREATE A CUSTOM PYTORCH DATASET
+----------------------------------------
+class CustomDataset(Dataset):
+
+    def __init__(self, features, labels, transforms):
+        self.features = features
+        self.labels = labels
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+
+        # Reshape the flattened pixels into a 28x28 image
+        image = self.features[index].reshape(28, 28)
+
+        # Convert the image to uint8
+        image = image.astype(np.uint8)
+
+        # Convert grayscale (H, W) to 3-channel RGB-like data (H, W, C)
+        image = np.stack([image] * 3, axis=-1)
+
+        # Convert NumPy array to PIL image
+        image = Image.fromarray(image)
+
+        # Apply resizing, cropping, tensor conversion and normalization
+        image = self.transforms(image)
+
+        # Return image tensor and integer class label
+        label = torch.tensor(self.labels[index], dtype=torch.long)
+
+        return image, label
+
+
+STEP 8 — CREATE TRAIN AND TEST DATASETS
+---------------------------------------
+train_dataset = CustomDataset(
+    X_train,
+    y_train,
+    transforms=custom_transform
+)
+
+test_dataset = CustomDataset(
+    X_test,
+    y_test,
+    transforms=custom_transform
+)
+
+
+STEP 9 — CREATE DATA LOADERS
+----------------------------
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=32,
+    shuffle=True,
+    pin_memory=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=32,
+    shuffle=False,
+    pin_memory=True
+)
+
+
+STEP 10 — LOAD PRETRAINED VGG16
+-------------------------------
+from torchvision.models import VGG16_Weights
+
+vgg16 = models.vgg16(weights=VGG16_Weights.DEFAULT)
+
+
+STEP 11 — FREEZE THE FEATURE EXTRACTOR
+--------------------------------------
+for param in vgg16.features.parameters():
+    param.requires_grad = False
+
+
+STEP 12 — REPLACE THE CLASSIFICATION HEAD
+-----------------------------------------
+vgg16.classifier = nn.Sequential(
+    nn.Linear(25088, 1024),
+    nn.ReLU(),
+    nn.Dropout(0.5),
+
+    nn.Linear(1024, 512),
+    nn.ReLU(),
+    nn.Dropout(0.5),
+
+    nn.Linear(512, 10)
+)
+
+vgg16 = vgg16.to(device)
+
+
+STEP 13 — DEFINE LOSS, OPTIMIZER AND EPOCHS
+-------------------------------------------
+learning_rate = 0.0001
+epochs = 20
+
+criterion = nn.CrossEntropyLoss()
+
+# Only classifier parameters are optimized because the feature extractor
+# has been frozen.
+optimizer = optim.Adam(
+    vgg16.classifier.parameters(),
+    lr=learning_rate
+)
+
+
+STEP 14 — TRAINING LOOP
+-----------------------
+for epoch in range(epochs):
+
+    vgg16.train()
+    total_epoch_loss = 0
+
+    for batch_features, batch_labels in train_loader:
+
+        # Move the current batch to the selected device
+        batch_features = batch_features.to(device)
+        batch_labels = batch_labels.to(device)
+
+        # Forward pass
+        outputs = vgg16(batch_features)
+
+        # Calculate classification loss
+        loss = criterion(outputs, batch_labels)
+
+        # Backpropagation and optimizer update
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_epoch_loss += loss.item()
+
+    avg_loss = total_epoch_loss / len(train_loader)
+
+    print(f"Epoch: {epoch + 1}, Loss: {avg_loss:.4f}")
+
+
+STEP 15 — EVALUATE THE MODEL
+----------------------------
+vgg16.eval()
+
+total = 0
+correct = 0
+
+with torch.no_grad():
+
+    for batch_features, batch_labels in test_loader:
+
+        # Move the batch to the selected device
+        batch_features = batch_features.to(device)
+        batch_labels = batch_labels.to(device)
+
+        # Forward pass
+        outputs = vgg16(batch_features)
+
+        # Get the class with the highest output score
+        _, predicted = torch.max(outputs, 1)
+
+        total += batch_labels.size(0)
+        correct += (predicted == batch_labels).sum().item()
+
+accuracy = correct / total
+
+print(f"Test Accuracy: {accuracy:.4f}")
+print(f"Test Accuracy: {accuracy * 100:.2f}%")
+
+
+STEP 16 — SAVE THE TRAINED MODEL
+-------------------------------
+torch.save(
+    vgg16.state_dict(),
+    "vgg16_fashion_81.pth"
+)
+
+
+STEP 17 — DOWNLOAD THE CHECKPOINT FROM GOOGLE COLAB
+---------------------------------------------------
+from google.colab import files
+
+files.download("vgg16_fashion_81.pth")
+
+
+NEXT SESSION — LOAD THE MODEL AND BUILD THE UI
+----------------------------------------------
+1. Recreate the same VGG16 architecture.
+2. Load the saved state_dict checkpoint.
+3. Move the model to the available device.
+4. Set the model to evaluation mode with model.eval().
+5. Preprocess uploaded images with the same transforms used during training.
+6. Build the prediction interface.
+7. Display the predicted Fashion-MNIST class.
+
+MODEL LOADING REMINDER
+----------------------
+The architecture must match the architecture used during training:
+
+from torchvision.models import VGG16_Weights
+
+model = models.vgg16(weights=None)
+
+for param in model.features.parameters():
+    param.requires_grad = False
+
+model.classifier = nn.Sequential(
+    nn.Linear(25088, 1024),
+    nn.ReLU(),
+    nn.Dropout(0.5),
+    nn.Linear(1024, 512),
+    nn.ReLU(),
+    nn.Dropout(0.5),
+    nn.Linear(512, 10)
+)
+
+model.load_state_dict(
+    torch.load("vgg16_fashion_81.pth", map_location=device)
+)
+
+model = model.to(device)
+model.eval()
+
+Fashion-MNIST class names (label order):
+0 - T-shirt/top
+1 - Trouser
+2 - Pullover
+3 - Dress
+4 - Coat
+5 - Sandal
+6 - Shirt
+7 - Sneaker
+8 - Bag
+9 - Ankle boot
+
+END OF PIPELINE
+===============
